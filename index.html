@@ -48,6 +48,23 @@
     renderer.shadowMap.enabled = true;
     document.body.appendChild(renderer.domElement);
 
+    // --- Compass inset: separate scene/camera, screen-fixed lower-left -----
+    // Kept out of the main `scene` (and off the stage floor) so it never
+    // collides with claw/prize geometry; rendered via renderScene() below
+    // into a small scissor/viewport in the canvas corner, matching the main
+    // camera's viewing angle so WASD <-> world-axis mapping still reads
+    // intuitively at a glance.
+    const compassScene = new THREE.Scene();
+    compassScene.add(new THREE.HemisphereLight(0xffffff, 0x31333a, 2.2));
+    const compassCamera = new THREE.PerspectiveCamera(42, 1, 0.1, 10);
+    {
+      // Reuse the main camera's look direction (not its position) so the
+      // inset reads at the same oblique angle as the stage.
+      const dir = camera.position.clone().sub(new THREE.Vector3(0, 2.6, 0)).normalize();
+      compassCamera.position.copy(dir.multiplyScalar(4.3));
+      compassCamera.lookAt(0, 0, 0);
+    }
+
     scene.add(new THREE.HemisphereLight(0xffffff, 0x31333a, 2.0));
     const sun = new THREE.DirectionalLight(0xffffff, 2.3);
     sun.position.set(6, 12, 7);
@@ -137,6 +154,79 @@
     label.position.set(3.55, 0.7, 3.88);
     label.rotation.x = -Math.PI / 2.8;
     scene.add(label);
+
+    // --- World-direction compass (screen inset, see renderScene()) --------
+    // Lives in `compassScene`, not the stage floor: real WASD -> world-axis
+    // mapping used by moveHub() below: W = -Z, S = +Z, A = -X, D = +X. Arrow
+    // bodies are literal 3D prisms placed/rotated by actual world-axis math
+    // (no texture-orientation guesswork — see addDirectionArrow). Purely
+    // visual: no physics body, no effect on claw/prize simulation. Drawn via
+    // the same WebGL canvas/context Clef's screenshot capture reads from.
+    const compassBase = new THREE.Mesh(
+      new THREE.CircleGeometry(1.0, 32),
+      new THREE.MeshBasicMaterial({ color: 0x0a0c12 })
+    );
+    compassBase.rotation.x = -Math.PI / 2;
+    compassScene.add(compassBase);
+
+    // Shape drawn in the local XY plane with +Y as "forward"; extruded along
+    // local Z for real thickness/relief instead of a paper-thin plane.
+    const arrowShape = new THREE.Shape();
+    arrowShape.moveTo(-0.08, 0.12);
+    arrowShape.lineTo(0.08, 0.12);
+    arrowShape.lineTo(0.08, 0.55);
+    arrowShape.lineTo(0.2, 0.55);
+    arrowShape.lineTo(0, 0.88);
+    arrowShape.lineTo(-0.2, 0.55);
+    arrowShape.lineTo(-0.08, 0.55);
+    arrowShape.closePath();
+    const arrowGeo = new THREE.ExtrudeGeometry(arrowShape, { depth: 0.07, bevelEnabled: false });
+
+    function addDirectionArrow(yaw, color, key, axisLabel) {
+      // mesh.rotation.x = -PI/2 lies the shape flat: local +Y (shape
+      // "forward") rotates to world -Z, local +X (lateral) stays world +X,
+      // and the extrude thickness (local +Z) rotates to world +Y (up) —
+      // the same rotation-matrix identity used for the DROP ZONE plane.
+      // group.rotation.y = yaw then spins that flat arrow within the inset's
+      // own ground plane; solving forward = (-sin(yaw), -cos(yaw)) for each
+      // cardinal direction gives yaw = 0 (-Z), PI (+Z), +PI/2 (-X), -PI/2 (+X).
+      const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.32, roughness: 0.4, metalness: 0.1 });
+      const mesh = new THREE.Mesh(arrowGeo, mat);
+      mesh.rotation.x = -Math.PI / 2;
+      const group = new THREE.Group();
+      group.add(mesh);
+      group.rotation.y = yaw;
+      compassScene.add(group);
+
+      const signCanvas = document.createElement('canvas');
+      signCanvas.width = 160;
+      signCanvas.height = 160;
+      const sc = signCanvas.getContext('2d');
+      sc.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
+      sc.beginPath();
+      sc.arc(80, 80, 74, 0, Math.PI * 2);
+      sc.fill();
+      sc.fillStyle = '#10121a';
+      sc.font = 'bold 64px sans-serif';
+      sc.textAlign = 'center';
+      sc.textBaseline = 'middle';
+      sc.fillText(key, 80, 64);
+      sc.font = '600 24px sans-serif';
+      sc.fillText(axisLabel, 80, 112);
+      const sign = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.62, 0.62),
+        new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(signCanvas), transparent: true })
+      );
+      sign.rotation.x = -Math.PI / 2.8;
+      const offset = 1.05;
+      sign.position.set(-Math.sin(yaw) * offset, 0.5, -Math.cos(yaw) * offset);
+      compassScene.add(sign);
+    }
+
+    addDirectionArrow(0, 0x6ee7ff, 'W', '-Z forward');
+    addDirectionArrow(Math.PI, 0xffb86e, 'S', '+Z back');
+    addDirectionArrow(Math.PI / 2, 0xff8de1, 'A', '-X left');
+    addDirectionArrow(-Math.PI / 2, 0x9bff6e, 'D', '+X right');
 
     const palette = [0xff5f6d, 0xffc857, 0x5ac8fa, 0x9b7bff, 0x6ee7a8, 0xff8de1];
 
@@ -791,8 +881,27 @@
       };
     }
 
-    function capture() {
+    // Unified render path: main stage, then the compass inset scissored into
+    // the lower-left corner of the SAME canvas (so capture() sees the arrows
+    // too), then restore full-canvas viewport/scissor state for next frame.
+    function renderScene() {
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, innerWidth, innerHeight);
       renderer.render(scene, camera);
+
+      const inset = Math.round(Math.min(innerHeight - 28, Math.max(160, Math.min(280, innerWidth * 0.25))));
+      const margin = 14;
+      renderer.setScissorTest(true);
+      renderer.setViewport(margin, margin, inset, inset);
+      renderer.setScissor(margin, margin, inset, inset);
+      renderer.clearDepth();
+      renderer.render(compassScene, compassCamera);
+      renderer.setScissorTest(false);
+      renderer.setViewport(0, 0, innerWidth, innerHeight);
+    }
+
+    function capture() {
+      renderScene();
       const src = renderer.domElement;
       const scale = Math.min(1, 768 / Math.max(src.width, src.height));
       const w = Math.max(1, Math.round(src.width * scale));
@@ -923,7 +1032,7 @@
 
       updateScore();
       stateEl.textContent = `${labels[state] ?? state.toUpperCase()}${grip ? ' • HOLD' : ''}`;
-      renderer.render(scene, camera);
+      renderScene();
 
       if (autoMode && pendingAutoStep && pendingAutoStep.finished) {
         finalizePendingAutoStep();

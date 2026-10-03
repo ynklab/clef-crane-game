@@ -21,5 +21,7 @@ uv run --no-sync python main.py
 Wait for the startup log `Clef model loaded and ready`, then open <http://127.0.0.1:8000/>. Startup probes CUDA/BF16 and loads `Cloudflare/clef` at revision `2f3de3dd85f379784083b0814d997ab627200f0c` into the standard Hugging Face cache. The browser enables automatic operation only after `/api/health` confirms that model is ready. Manual WASD/arrow and Space controls remain available while auto is stopped.
 The service binds to `0.0.0.0:8000` (accessible on the host's network interfaces). Stop it with Ctrl-C. No API key is required.
 
+Because the camera is oblique, a compact screen-fixed compass in the lower-left corner (rendered in its own inset viewport, outside the 3D stage) shows the real WASD -> world-axis mapping (W = -Z, A = -X, S = +Z, D = +X) with colored 3D arrows and key-letter signs; it is a purely visual overlay and does not affect physics, scoring, or controls.
+
 During release, the claw opens more gently to reduce sideways kicks from the pads. Prizes still fall and collide under the existing physics; grip eligibility and scoring are unchanged.
 
