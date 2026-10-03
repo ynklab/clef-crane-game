@@ -63,7 +63,7 @@ function sampleAnswer(answer, allowedChoices) {
   return { ...answer, choice, confidence: answer.probabilities[choice] };
 }
 
-export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto }) {
+export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto, armType }) {
   const style = document.createElement('style');
   style.textContent = `
     #clef-panel {
@@ -107,6 +107,14 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
       <button id="clef-stop" disabled>停止</button>
       <button id="clef-reset">リセット</button>
     </div>
+    <div class="clef-row">
+      <label for="clef-arm">アーム形状:</label>
+      <select id="clef-arm">
+        <option value="three">3本アーム</option>
+        <option value="two">2本アーム</option>
+        <option value="scoop">板状の掬いヘラ</option>
+      </select>
+    </div>
     <div class="clef-row">状態: <span id="clef-status">初期化中</span></div>
     <div class="clef-row">判断回数: <span id="clef-count">0</span></div>
     <div class="clef-row">クレーン位置: <span id="clef-position">-</span></div>
@@ -123,6 +131,7 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
     start: panel.querySelector('#clef-start'),
     stop: panel.querySelector('#clef-stop'),
     reset: panel.querySelector('#clef-reset'),
+    arm: panel.querySelector('#clef-arm'),
     status: panel.querySelector('#clef-status'),
     count: panel.querySelector('#clef-count'),
     position: panel.querySelector('#clef-position'),
@@ -131,6 +140,7 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
     probabilities: panel.querySelector('#clef-probabilities'),
     history: panel.querySelector('#clef-history'),
   };
+  els.arm.value = armType;
 
   let healthReady = false;
   let running = false;
@@ -148,6 +158,7 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
     els.start.disabled = running || resetting || !healthReady || inFlightFetch !== null;
     els.stop.disabled = !running || resetting;
     els.reset.disabled = resetting;
+    els.arm.disabled = running || resetting || inFlightFetch !== null;
   }
 
   function renderPosition(obs) {
@@ -350,7 +361,7 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
     updateButtons();
   }
 
-  async function reset() {
+  async function reset(nextArm) {
     if (resetting) return;
     resetting = true;
     generation += 1;
@@ -363,12 +374,19 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
     if (pending) {
       try { await pending; } catch { /* discard stale response */ }
     }
-    location.reload();
+    if (nextArm) {
+      const url = new URL(location.href);
+      url.searchParams.set('arm', nextArm);
+      location.assign(url.href);
+    } else {
+      location.reload();
+    }
   }
 
   els.start.addEventListener('click', start);
   els.stop.addEventListener('click', stop);
-  els.reset.addEventListener('click', reset);
+  els.reset.addEventListener('click', () => reset());
+  els.arm.addEventListener('change', () => reset(els.arm.value));
 
   (async () => {
     setStatus('モデル確認中...');

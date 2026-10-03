@@ -102,3 +102,52 @@ error types (never the image/base64 or request body) for diagnosis.
 
 During release, the claw opens more gently to reduce sideways kicks from the pads. Prizes still fall and collide under the existing physics; grip eligibility and scoring are unchanged.
 
+## Prize variety and sizes
+
+The 12 prizes cycle through five shapes — sphere, box, cone, tetrahedron, and
+cylinder — in a fixed round-robin order (`i % 5`), so every shape appears at
+least twice. Each prize independently samples a uniform random scale in
+`0.7..1.15` applied to that shape's nominal dimensions, so sizes vary prize
+to prize even within the same shape. Mass scales with volume as
+`0.72 * scale**3` instead of a flat mass, so larger prizes are heavier.
+
+The rendered Three.js mesh and the cannon-es collision body are built from
+the same actual (post-scale) dimensions for every shape:
+sphere/box use `CANNON.Sphere`/`CANNON.Box` directly; cylinder uses
+`CANNON.Cylinder` (its axis already matches `THREE.CylinderGeometry`'s, so no
+extra rotation is applied); cone and tetrahedron both use a shared
+apex-at-top convex-hull builder (the tetrahedron is just that builder's
+3-segment case) with winding verified to produce outward-facing normals in
+both cannon-es and Three — there is no degenerate zero-radius cone and no
+flat/inside-out hull. The `shape` field reported by `observe()` always
+matches the real collision geometry:
+`{type:'sphere',radius}`, `{type:'box',half_extents:[...]}`,
+`{type:'cone'|'tetrahedron'|'cylinder', radius, height}`, with every number
+being the prize's actual scaled size, not a nominal/rounded one. Prizes
+spawn with their own bounding-radius-based clearance above the cabinet
+floor, so even the largest (1.15x), arbitrarily tilted shape never starts
+embedded in the floor.
+
+## Arm selection
+
+The **アーム形状** selector offers **3本アーム**, **2本アーム**, and
+**板状の掬いヘラ**. Selection reloads the game with fresh randomized prizes;
+the `arm=three|two|scoop` URL parameter preserves the selected mechanism across
+resets. The selector is disabled during automatic operation or an outstanding
+model request; Stop waits for that request before selection becomes available.
+
+The claws use three radially spaced or two opposing dynamic hinged fingers.
+The scoop is a thin, bent (く-shaped) blade on a single Z-axis pivot: it
+rotates -90 degrees to a vertical insertion pose before the gantry ever lowers,
+holds that pose through descent, then rotates +90 degrees back to the level pose
+during closing. That rotation alone -- the gantry never translates
+horizontally during the sequence -- sweeps the blade's shallow-arced,
+thin leading/bottom edge underneath a resting prize. Squeezing, raising and
+carrying keep the blade level; release rotates it a further -90 degrees,
+back toward the insertion orientation, to clear contact support.
+There are no side/rear guides or springs; a prize is only "held" while a
+real upward-facing contact between the blade and the prize is detected every
+frame, and the flag clears on loss of support or release. Scoring remains
+based on the real tray position and settling speed. Different shapes, sizes
+and mechanisms can miss or drop a prize; pickup is not guaranteed.
+
