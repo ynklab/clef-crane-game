@@ -162,10 +162,13 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
       setStatus('推論中...');
 
       const image = capture();
+      // モデルへは最小限の情報のみ送る: phase, has_prize(=held_prize_id有無), image, 簡略履歴。
+      // 座標・速度・得点・景品リストなどの詳細観測はローカル(HUD/historyLog)にのみ保持する。
       const requestBody = {
-        observation: before,
+        phase: before.phase,
+        has_prize: before.claw.held_prize_id !== null,
         image,
-        history: historyLog.slice(),
+        history: historyLog.slice().map(({ action, step }) => ({ action, step })),
       };
 
       let fetchPromise;
