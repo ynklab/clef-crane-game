@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cannon-es Crane Game</title>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #111; }
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    canvas { display: block; }
+    #ui {
+      position: fixed; left: 16px; top: 16px; z-index: 10;
+      padding: 12px 14px; border-radius: 12px;
+      background: rgba(0,0,0,.58); color: #fff; line-height: 1.45;
+      backdrop-filter: blur(8px); user-select: none;
+    }
+    #ui b { font-size: 16px; }
+    #state { color: #9ee7ff; }
+    #score { color: #ffe082; }
+    #hint { opacity: .75; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <b>cannon-es Crane Game</b><br>
+    移動: WASD / 矢印キー<br>
+    Space: アーム動作 / 景品を離す<br>
+    状態: <span id="state">READY</span><br>
+    SCORE: <span id="score">0</span><br>
+    <span id="hint">3本爪は動的剛体＋ヒンジモーター。景品を物理的に押し返します</span>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://esm.sh/three@0.179.1';
+    import * as CANNON from 'https://esm.sh/cannon-es@0.20.0';
+    import { mountClefDemo } from './clef-demo.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x16181d);
+
+    const camera = new THREE.PerspectiveCamera(48, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(10, 9, 12);
+    camera.lookAt(0, 2.6, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x31333a, 2.0));
+    const sun = new THREE.DirectionalLight(0xffffff, 2.3);
+    sun.position.set(6, 12, 7);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    scene.add(sun);
+
+    const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+    world.allowSleep = true;
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.solver.iterations = 36;
+    world.solver.tolerance = 0.001;
+
+    const prizeMaterial = new CANNON.Material('prize');
+    const clawMaterial = new CANNON.Material('claw');
+    world.addContactMaterial(new CANNON.ContactMaterial(prizeMaterial, prizeMaterial, {
+      friction: 0.45,
+      restitution: 0.12,
+      contactEquationStiffness: 1e7,
+      contactEquationRelaxation: 3,
+    }));
+    world.addContactMaterial(new CANNON.ContactMaterial(clawMaterial, prizeMaterial, {
+      friction: 1.8,
+      restitution: 0.02,
+      contactEquationStiffness: 2e7,
+      contactEquationRelaxation: 2,
+      frictionEquationStiffness: 2e7,
+      frictionEquationRelaxation: 2,
+    }));
+    world.defaultContactMaterial.friction = 0.5;
+    world.defaultContactMaterial.restitution = 0.08;
+
+    const dynamicObjects = [];
+    const prizes = [];
+    const prizeByBody = new Map();
+    const fingerIndexByBody = new Map();
+
+    function addStaticBox(size, position, color, opacity = 1) {
+      const [sx, sy, sz] = size;
+      const [x, y, z] = position;
+
+      const body = new CANNON.Body({ mass: 0, material: prizeMaterial });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(sx / 2, sy / 2, sz / 2)));
+      body.position.set(x, y, z);
+      world.addBody(body);
+
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(sx, sy, sz),
+        new THREE.MeshStandardMaterial({ color, transparent: opacity < 1, opacity })
+      );
+      mesh.position.set(x, y, z);
+      mesh.receiveShadow = true;
+      mesh.castShadow = true;
+      scene.add(mesh);
+      return { body, mesh };
+    }
+
+    // Cabinet floor and walls.
+    addStaticBox([10, 0.5, 8], [0, -0.25, 0], 0x2a2d35);
+    addStaticBox([10, 1.3, 0.25], [0, 0.65, -4], 0x3a3f48, 0.85);
+    addStaticBox([0.25, 1.3, 8], [-5, 0.65, 0], 0x3a3f48, 0.85);
+    addStaticBox([0.25, 1.3, 8], [5, 0.65, 0], 0x3a3f48, 0.85);
+    addStaticBox([10, 0.45, 0.25], [0, 0.225, 4], 0x3a3f48, 0.85);
+
+    // Prize tray / target zone.
+    addStaticBox([2.4, 0.16, 2.0], [3.55, 0.08, 2.8], 0x1f6f50);
+    addStaticBox([2.4, 0.55, 0.12], [3.55, 0.275, 3.75], 0x2f946e);
+    addStaticBox([0.12, 0.55, 2.0], [4.69, 0.275, 2.8], 0x2f946e);
+    addStaticBox([0.12, 0.55, 2.0], [2.41, 0.275, 2.8], 0x2f946e);
+
+    const trayLabel = document.createElement('canvas');
+    trayLabel.width = 256;
+    trayLabel.height = 64;
+    const ctx = trayLabel.getContext('2d');
+    ctx.fillStyle = '#1f6f50';
+    ctx.fillRect(0, 0, 256, 64);
+    ctx.fillStyle = 'white';
+    ctx.font = 'bold 26px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('DROP ZONE', 128, 32);
+    const labelTex = new THREE.CanvasTexture(trayLabel);
+    const label = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.2, 0.55),
+      new THREE.MeshBasicMaterial({ map: labelTex, transparent: true })
+    );
+    label.position.set(3.55, 0.7, 3.88);
+    label.rotation.x = -Math.PI / 2.8;
+    scene.add(label);
+
+    const palette = [0xff5f6d, 0xffc857, 0x5ac8fa, 0x9b7bff, 0x6ee7a8, 0xff8de1];
+
+    function addPrize(i) {
+      const isSphere = i % 3 === 0;
+      const color = palette[i % palette.length];
+      const x = -3.7 + (i % 4) * 1.4 + (Math.random() - 0.5) * 0.25;
+      const z = -2.5 + Math.floor(i / 4) * 1.3 + (Math.random() - 0.5) * 0.25;
+      const y = 0.55 + Math.floor(i / 8) * 0.8;
+
+      const body = new CANNON.Body({ mass: 0.72, material: prizeMaterial });
+      body.linearDamping = 0.08;
+      body.angularDamping = 0.12;
+      body.allowSleep = true;
+      body.sleepSpeedLimit = 0.12;
+      body.sleepTimeLimit = 0.7;
+
+      let mesh;
+      if (isSphere) {
+        body.addShape(new CANNON.Sphere(0.42));
+        mesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.42, 24, 18),
+          new THREE.MeshStandardMaterial({ color, roughness: 0.62 })
+        );
+      } else {
+        body.addShape(new CANNON.Box(new CANNON.Vec3(0.38, 0.38, 0.38)));
+        mesh = new THREE.Mesh(
+          new THREE.BoxGeometry(0.76, 0.76, 0.76),
+          new THREE.MeshStandardMaterial({ color, roughness: 0.58 })
+        );
+      }
+
+      body.position.set(x, y, z);
+      body.quaternion.setFromEuler(Math.random() * 0.2, Math.random() * Math.PI, Math.random() * 0.2);
+      world.addBody(body);
+
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const shape = isSphere
+        ? { type: 'sphere', radius: 0.42 }
+        : { type: 'box', half_extents: [0.38, 0.38, 0.38] };
+      const item = { body, mesh, scored: false, shape };
+      prizes.push(item);
+      prizeByBody.set(body, item);
+      dynamicObjects.push(item);
+    }
+
+    for (let i = 0; i < 12; i++) addPrize(i);
+
+    // Gantry rails.
+    const railMat = new THREE.MeshStandardMaterial({ color: 0xcfd6df, metalness: 0.55, roughness: 0.35 });
+    function rail(size, pos) {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), railMat);
+      mesh.position.set(...pos);
+      mesh.castShadow = true;
+      scene.add(mesh);
+      return mesh;
+    }
+    rail([9.2, 0.14, 0.14], [0, 7.0, -3.3]);
+    rail([9.2, 0.14, 0.14], [0, 7.0, 3.3]);
+    const bridge = rail([0.16, 0.16, 6.6], [0, 6.88, 0]);
+
+    const carriage = new THREE.Mesh(
+      new THREE.BoxGeometry(0.78, 0.30, 0.78),
+      new THREE.MeshStandardMaterial({ color: 0xe84a5f, metalness: 0.28, roughness: 0.38 })
+    );
+    carriage.position.y = 6.9;
+    carriage.castShadow = true;
+    scene.add(carriage);
+
+    const cable = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.025, 0.025, 1, 8),
+      new THREE.MeshStandardMaterial({ color: 0x20242b, metalness: 0.3, roughness: 0.5 })
+    );
+    scene.add(cable);
+
+    // Physical claw.
+    //
+    // The head is kinematic because the gantry/cable prescribes its translation.
+    // Each finger, however, is a *dynamic* rigid body attached to the head by a
+    // real cannon-es HingeConstraint.  A hinge motor opens/closes the finger.
+    // This is crucial: rotating a KINEMATIC finger by directly overwriting its
+    // quaternion can teleport the collider through a sleeping prize between solver
+    // passes.  Dynamic hinged fingers participate in the contact solver and are
+    // therefore stopped/deflected by prizes instead of passing through them.
+    const CLAW_GROUP = 2;
+    const WORLD_GROUP = 1;
+
+    const topY = 6.15;
+    const bottomY = 1.55;
+    const openAngle = 0.72;
+    const closedAngle = 0.53;   // motor keeps preload when an object blocks closure
+    const releaseAngle = 0.90;
+
+    const hubBody = new CANNON.Body({
+      mass: 0,
+      type: CANNON.Body.KINEMATIC,
+      material: clawMaterial,
+      collisionFilterGroup: CLAW_GROUP,
+      collisionFilterMask: WORLD_GROUP,
+    });
+    // Approximate the visible yellow head with compound boxes.  It is deliberately
+    // a little conservative (slightly larger) so the visible shell never enters a prize.
+    hubBody.addShape(new CANNON.Box(new CANNON.Vec3(0.34, 0.23, 0.34)));
+    hubBody.addShape(
+      new CANNON.Box(new CANNON.Vec3(0.16, 0.16, 0.16)),
+      new CANNON.Vec3(0, 0.29, 0)
+    );
+    hubBody.position.set(0, topY, 0);
+    world.addBody(hubBody);
+
+    const hubMesh = new THREE.Group();
+    const hubShell = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.27, 0.36, 0.44, 20),
+      new THREE.MeshStandardMaterial({ color: 0xffd54f, metalness: 0.25, roughness: 0.42 })
+    );
+    hubShell.castShadow = true;
+    hubMesh.add(hubShell);
+
+    const collar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.14, 0.14, 0.18, 16),
+      new THREE.MeshStandardMaterial({ color: 0x363b44, metalness: 0.6, roughness: 0.3 })
+    );
+    collar.position.y = 0.29;
+    collar.castShadow = true;
+    hubMesh.add(collar);
+    scene.add(hubMesh);
+
+    const fingerMat = new THREE.MeshStandardMaterial({
+      color: 0xd9dee7,
+      metalness: 0.72,
+      roughness: 0.24,
+    });
+    const padMat = new THREE.MeshStandardMaterial({
+      color: 0x3b4048,
+      metalness: 0.15,
+      roughness: 0.8,
+    });
+
+    // cannon-es integrates KINEMATIC bodies from velocity.  The hub is placed at
+    // the pose used for narrowphase and supplied with velocity for realistic contact
+    // relative velocity; after each step it is restored to the prescribed cable pose.
+    const kinematicTargets = new Map();
+
+    function rememberKinematicTarget(body) {
+      let target = kinematicTargets.get(body);
+      if (!target) {
+        target = {
+          position: new CANNON.Vec3(),
+          quaternion: new CANNON.Quaternion(),
+        };
+        kinematicTargets.set(body, target);
+      }
+      target.position.copy(body.position);
+      target.quaternion.copy(body.quaternion);
+      body.aabbNeedsUpdate = true;
+    }
+
+    function restoreKinematicTargets() {
+      for (const [body, target] of kinematicTargets) {
+        body.position.copy(target.position);
+        body.quaternion.copy(target.quaternion);
+        body.velocity.set(0, 0, 0);
+        body.angularVelocity.set(0, 0, 0);
+        body.aabbNeedsUpdate = true;
+      }
+    }
+
+    const fingers = [];
+    const tmpQYaw = new CANNON.Quaternion();
+    const tmpQTilt = new CANNON.Quaternion();
+    const tmpQStart = new CANNON.Quaternion();
+    const tmpQInvYaw = new CANNON.Quaternion();
+    const tmpQRel = new CANNON.Quaternion();
+    const cannonAxisY = new CANNON.Vec3(0, 1, 0);
+    const cannonAxisZ = new CANNON.Vec3(0, 0, 1);
+
+    for (let i = 0; i < 3; i++) {
+      const yaw = i * Math.PI * 2 / 3;
+      const body = new CANNON.Body({
+        mass: 0.42,
+        type: CANNON.Body.DYNAMIC,
+        material: clawMaterial,
+        collisionFilterGroup: CLAW_GROUP,
+        collisionFilterMask: WORLD_GROUP,
+        allowSleep: false,
+      });
+      body.linearDamping = 0.18;
+      body.angularDamping = 0.72;
+
+      // Compound collider exactly mirrors the three visible pieces.
+      const upper = new CANNON.Box(new CANNON.Vec3(0.075, 0.43, 0.085));
+      body.addShape(upper, new CANNON.Vec3(0, -0.45, 0));
+
+      const hookRot = new CANNON.Quaternion();
+      hookRot.setFromAxisAngle(cannonAxisZ, -0.86);
+      const hook = new CANNON.Box(new CANNON.Vec3(0.07, 0.29, 0.09));
+      body.addShape(hook, new CANNON.Vec3(-0.20, -0.90, 0), hookRot);
+
+      const pad = new CANNON.Box(new CANNON.Vec3(0.11, 0.11, 0.12));
+      body.addShape(pad, new CANNON.Vec3(-0.43, -1.08, 0));
+
+      // Initial pose: body origin is the mechanical hinge pivot.
+      const radialX = Math.cos(yaw);
+      const radialZ = -Math.sin(yaw);
+      body.position.set(
+        hubBody.position.x + radialX * 0.24,
+        hubBody.position.y - 0.08,
+        hubBody.position.z + radialZ * 0.24
+      );
+      tmpQYaw.setFromAxisAngle(cannonAxisY, yaw);
+      tmpQTilt.setFromAxisAngle(cannonAxisZ, openAngle);
+      tmpQYaw.mult(tmpQTilt, tmpQStart);
+      body.quaternion.copy(tmpQStart);
+      world.addBody(body);
+      fingerIndexByBody.set(body, i);
+
+      // The hinge axis is tangential around the claw.  axisA is expressed in the
+      // unrotated hub frame; axisB is local +Z of each finger body.
+      const axisA = new CANNON.Vec3(Math.sin(yaw), 0, Math.cos(yaw));
+      const pivotA = new CANNON.Vec3(radialX * 0.24, -0.08, radialZ * 0.24);
+      const hinge = new CANNON.HingeConstraint(hubBody, body, {
+        pivotA,
+        pivotB: new CANNON.Vec3(0, 0, 0),
+        axisA,
+        axisB: new CANNON.Vec3(0, 0, 1),
+        collideConnected: false,
+        maxForce: 2e5,
+      });
+      hinge.enableMotor();
+      hinge.setMotorMaxForce(18);
+      world.addConstraint(hinge);
+
+      const mesh = new THREE.Group();
+      const upperMesh = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.86, 0.17), fingerMat);
+      upperMesh.position.set(0, -0.45, 0);
+      upperMesh.castShadow = true;
+      mesh.add(upperMesh);
+
+      const hookMesh = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.58, 0.18), fingerMat);
+      hookMesh.position.set(-0.20, -0.90, 0);
+      hookMesh.rotation.z = -0.86;
+      hookMesh.castShadow = true;
+      mesh.add(hookMesh);
+
+      const padMesh = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.24), padMat);
+      padMesh.position.set(-0.43, -1.08, 0);
+      padMesh.castShadow = true;
+      mesh.add(padMesh);
+      scene.add(mesh);
+
+      // qYaw is constant and is also used to recover the actual hinge angle.
+      const yawQ = new CANNON.Quaternion();
+      yawQ.setFromAxisAngle(cannonAxisY, yaw);
+      fingers.push({ body, mesh, yaw, yawQ, hinge });
+    }
+
+    function normalizedAngle(a) {
+      while (a > Math.PI) a -= Math.PI * 2;
+      while (a < -Math.PI) a += Math.PI * 2;
+      return a;
+    }
+
+    function getFingerAngle(f) {
+      // qFinger = qYaw * qTilt, so qTilt = inverse(qYaw) * qFinger.
+      f.yawQ.conjugate(tmpQInvYaw);
+      tmpQInvYaw.mult(f.body.quaternion, tmpQRel);
+      return normalizedAngle(2 * Math.atan2(tmpQRel.z, tmpQRel.w));
+    }
+
+    function getAverageFingerAngle() {
+      let sum = 0;
+      for (const f of fingers) sum += getFingerAngle(f);
+      return sum / fingers.length;
+    }
+    const stateEl = document.querySelector('#state');
+    const scoreEl = document.querySelector('#score');
+    const keys = new Set();
+
+    let state = 'idle';
+    let phaseTime = 0;
+    let targetX = 0;
+    let targetZ = 0;
+    let fingerAngle = openAngle; // measured physical hinge angle
+    let fingerTarget = openAngle;
+    let score = 0;
+
+    const labels = {
+      idle: 'READY',
+      preopen: 'OPEN',
+      descending: 'DOWN',
+      settling: 'SETTLE',
+      closing: 'GRAB',
+      squeezing: 'SQUEEZE',
+      raising: 'UP',
+      carrying: 'CARRY',
+      releasing: 'RELEASE',
+    };
+
+    function setState(next) {
+      state = next;
+      phaseTime = 0;
+      stateEl.textContent = labels[next] ?? next.toUpperCase();
+    }
+
+    function triggerArm() {
+      if (state === 'idle') {
+        fingerTarget = releaseAngle;
+        setState('preopen');
+      } else if (state === 'carrying') {
+        fingerTarget = releaseAngle;
+        setState('releasing');
+      }
+    }
+
+    addEventListener('keydown', (e) => {
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+      if (autoMode) return;
+      keys.add(e.code);
+      if (e.code === 'Space' && !e.repeat) triggerArm();
+    });
+    addEventListener('keyup', (e) => {
+      if (autoMode) return;
+      keys.delete(e.code);
+    });
+
+    function moveToward(current, target, speed, dt) {
+      const delta = target - current;
+      return Math.abs(delta) <= speed * dt ? target : current + Math.sign(delta) * speed * dt;
+    }
+
+    function moveHub(dt) {
+      const canDrive = state === 'idle' || state === 'carrying';
+      if (canDrive) {
+        const speed = state === 'carrying' ? 2.2 : 3.1;
+        let dx = 0;
+        let dz = 0;
+        if (keys.has('KeyA') || keys.has('ArrowLeft')) dx -= 1;
+        if (keys.has('KeyD') || keys.has('ArrowRight')) dx += 1;
+        if (keys.has('KeyW') || keys.has('ArrowUp')) dz -= 1;
+        if (keys.has('KeyS') || keys.has('ArrowDown')) dz += 1;
+        const len = Math.hypot(dx, dz) || 1;
+        targetX += dx / len * speed * dt;
+        targetZ += dz / len * speed * dt;
+        targetX = THREE.MathUtils.clamp(targetX, -4.15, 4.15);
+        targetZ = THREE.MathUtils.clamp(targetZ, -3.15, 3.15);
+      }
+
+      let desiredY = topY;
+      if (['descending', 'settling', 'closing', 'squeezing'].includes(state)) desiredY = bottomY;
+
+      const oldX = hubBody.position.x;
+      const oldY = hubBody.position.y;
+      const oldZ = hubBody.position.z;
+      const x = moveToward(oldX, targetX, canDrive ? 3.8 : 2.2, dt);
+      const z = moveToward(oldZ, targetZ, canDrive ? 3.8 : 2.2, dt);
+      const ySpeed = state === 'raising' ? 1.15 : 1.8;
+      const y = moveToward(oldY, desiredY, ySpeed, dt);
+
+      hubBody.position.set(x, y, z);
+      hubBody.velocity.set(
+        (x - oldX) / Math.max(dt, 1e-5),
+        (y - oldY) / Math.max(dt, 1e-5),
+        (z - oldZ) / Math.max(dt, 1e-5)
+      );
+      rememberKinematicTarget(hubBody);
+
+      bridge.position.x = x;
+      carriage.position.set(x, 6.9, z);
+      hubMesh.position.set(x, y, z);
+
+      const cableLength = Math.max(0.35, 6.74 - y);
+      cable.scale.y = cableLength;
+      cable.position.set(x, 6.74 - cableLength / 2, z);
+    }
+
+    function animateFingers(dt) {
+      // Drive the actual hinge motors.  No finger position or quaternion is ever
+      // teleported here: cannon-es constraints + contacts determine the result.
+      // A blocked finger therefore stops against the prize while the motor keeps
+      // applying a finite clamping torque, just like a real crane claw.
+      fingerAngle = getAverageFingerAngle();
+
+      for (const f of fingers) {
+        const current = getFingerAngle(f);
+        const error = normalizedAngle(fingerTarget - current);
+
+        // Retract gently during release to reduce the pads' sideways impulse.
+        // Unloaded opening and all closing speeds remain unchanged.
+        const openSpeed = state === 'releasing' ? 1.05 : 2.15;
+        const maxSpeed = error >= 0 ? openSpeed : 1.05;
+        // HingeConstraint's motor target is defined as wA - wB along the
+        // hinge axis.  The hub (A) is fixed rotationally, so body B must receive
+        // the opposite signed target velocity to move toward +error.
+        const motorSpeed = -THREE.MathUtils.clamp(error * 7.0, -maxSpeed, maxSpeed);
+        f.hinge.setMotorSpeed(motorSpeed);
+
+        // Keep every finger awake while the mechanism is active. Sleeping dynamic
+        // fingers are undesirable because the motor is an actively powered joint.
+        f.body.wakeUp();
+      }
+    }
+
+    function updateSequence(dt) {
+      phaseTime += dt;
+
+      if (state === 'preopen') {
+        fingerTarget = releaseAngle;
+        if (phaseTime > 0.28 && Math.abs(fingerAngle - releaseAngle) < 0.03) {
+          setState('descending');
+        }
+      } else if (state === 'descending') {
+        fingerTarget = openAngle;
+        if (Math.abs(hubBody.position.y - bottomY) < 0.015) {
+          setState('settling');
+        }
+      } else if (state === 'settling') {
+        // Real machines pause briefly before energising the claw.
+        if (phaseTime > 0.18) {
+          fingerTarget = closedAngle;
+          setState('closing');
+        }
+      } else if (state === 'closing') {
+        fingerTarget = closedAngle;
+        if (phaseTime > 0.72 || Math.abs(fingerAngle - closedAngle) < 0.015) {
+          setState('squeezing');
+        }
+      } else if (state === 'squeezing') {
+        fingerTarget = closedAngle;
+        if (phaseTime > 0.45) setState('raising');
+      } else if (state === 'raising') {
+        fingerTarget = closedAngle;
+        if (Math.abs(hubBody.position.y - topY) < 0.015) setState('carrying');
+      } else if (state === 'carrying') {
+        fingerTarget = closedAngle;
+      } else if (state === 'releasing') {
+        fingerTarget = releaseAngle;
+        if (phaseTime > 0.55 && Math.abs(fingerAngle - releaseAngle) < 0.03) {
+          fingerTarget = openAngle;
+          setState('idle');
+        }
+      } else {
+        fingerTarget = openAngle;
+      }
+    }
+
+    // cannon-es' Coulomb friction alone is numerically fragile for a claw that is
+    // driven kinematically: once the prize is exactly tangent to the pads, the solver
+    // can lose the clamp preload that a real motor would keep applying.  We therefore
+    // add a compliant (spring) grip only after TWO OR MORE different fingers are in
+    // actual contact with the same prize.  It is not a magnetic nearest-object grab:
+    // a missed grab still misses, and the spring can slip/break if the prize lags too far.
+    let grip = null;
+
+    function collectFingerContacts() {
+      const result = new Map();
+      for (const contact of world.contacts) {
+        if (contact.enabled === false) continue;
+
+        let fingerIndex = null;
+        let prize = null;
+        if (fingerIndexByBody.has(contact.bi) && prizeByBody.has(contact.bj)) {
+          fingerIndex = fingerIndexByBody.get(contact.bi);
+          prize = prizeByBody.get(contact.bj);
+        } else if (fingerIndexByBody.has(contact.bj) && prizeByBody.has(contact.bi)) {
+          fingerIndex = fingerIndexByBody.get(contact.bj);
+          prize = prizeByBody.get(contact.bi);
+        }
+        if (fingerIndex === null || !prize) continue;
+
+        let set = result.get(prize);
+        if (!set) result.set(prize, set = new Set());
+        set.add(fingerIndex);
+      }
+      return result;
+    }
+
+    function tryAcquireGrip() {
+      if (grip || !['closing', 'squeezing', 'raising'].includes(state)) return;
+      if (fingerAngle > 0.64) return;
+
+      const contacts = collectFingerContacts();
+      let best = null;
+      let bestScore = -Infinity;
+
+      for (const [prize, fingerSet] of contacts) {
+        if (fingerSet.size < 2) continue;
+
+        const dx = prize.body.position.x - hubBody.position.x;
+        const dy = prize.body.position.y - hubBody.position.y;
+        const dz = prize.body.position.z - hubBody.position.z;
+        const radial = Math.hypot(dx, dz);
+
+        // Only objects geometrically enclosed by the claw are eligible.
+        if (radial > 0.68 || dy > -0.45 || dy < -1.55) continue;
+
+        const score = fingerSet.size * 10 - radial;
+        if (score > bestScore) {
+          bestScore = score;
+          best = prize;
+        }
+      }
+
+      if (!best) return;
+
+      const localAnchorA = new CANNON.Vec3(
+        best.body.position.x - hubBody.position.x,
+        best.body.position.y - hubBody.position.y,
+        best.body.position.z - hubBody.position.z
+      );
+
+      const spring = new CANNON.Spring(hubBody, best.body, {
+        localAnchorA,
+        localAnchorB: new CANNON.Vec3(0, 0, 0),
+        restLength: 0,
+        stiffness: 190,
+        damping: 12,
+      });
+
+      best.body.wakeUp();
+      grip = { prize: best, spring, localAnchorA };
+    }
+
+    function releaseGrip() {
+      grip = null;
+    }
+
+    function applyGripAssist() {
+      if (!grip) return;
+
+      if (state === 'releasing' || state === 'idle' || fingerAngle > 0.70) {
+        releaseGrip();
+        return;
+      }
+
+      // hubBody never rotates, so its local anchor transforms by translation only.
+      const targetX = hubBody.position.x + grip.localAnchorA.x;
+      const targetY = hubBody.position.y + grip.localAnchorA.y;
+      const targetZ = hubBody.position.z + grip.localAnchorA.z;
+      const dx = grip.prize.body.position.x - targetX;
+      const dy = grip.prize.body.position.y - targetY;
+      const dz = grip.prize.body.position.z - targetZ;
+      const error = Math.hypot(dx, dy, dz);
+
+      // A sufficiently large lag means the prize slipped out of the pads.
+      if (error > 0.34) {
+        releaseGrip();
+        return;
+      }
+
+      grip.spring.applyForce();
+    }
+
+    function updateScore() {
+      for (const p of prizes) {
+        if (p.scored) continue;
+        const { x, y, z } = p.body.position;
+        const inTray = x > 2.45 && x < 4.65 && z > 1.9 && z < 3.75 && y < 0.95;
+        if (inTray && p.body.velocity.length() < 1.2) {
+          p.scored = true;
+          score += 1;
+          scoreEl.textContent = String(score);
+        }
+      }
+    }
+
+    // ---- Clef auto-operation adapter -------------------------------------
+    // Exposes a read-only observation of the physical state, a frame capture,
+    // and tick-accurate action execution. Physics rules themselves (moveHub,
+    // updateSequence, grip, scoring) are untouched; this layer only drives the
+    // same `keys` set and `triggerArm()` entry point that manual input uses,
+    // and gates how many fixed physicsTicks the main loop may run per call.
+    let autoMode = false;
+    let autoWaiting = false;
+    let pendingAutoStep = null;
+    const AUTO_MECHANISM_MAX_TICKS = 3600; // 30s of simulated time
+
+    function waitTicks(ticksTotal) {
+      return new Promise((resolve, reject) => {
+        pendingAutoStep = { kind: 'fixed', ticksTotal, ticksDone: 0, finished: false, resolve, reject };
+        autoWaiting = false;
+      });
+    }
+
+    function waitForPhase(targetPhases, maxTicks) {
+      return new Promise((resolve, reject) => {
+        pendingAutoStep = {
+          kind: 'phase-wait',
+          targetPhases,
+          maxTicks,
+          ticksDone: 0,
+          finished: false,
+          resolve,
+          reject,
+        };
+        autoWaiting = false;
+      });
+    }
+
+    // Returns true once the pending step is finished (success or timeout), so
+    // the caller can stop ticking for the remainder of this animation frame.
+    function evaluatePendingAutoStep() {
+      const step = pendingAutoStep;
+      if (step.kind === 'fixed') {
+        if (step.ticksDone >= step.ticksTotal) step.finished = true;
+      } else if (step.kind === 'phase-wait') {
+        if (step.targetPhases.includes(state)) {
+          step.finished = true;
+        } else if (step.ticksDone >= step.maxTicks) {
+          step.finished = true;
+          step.error = `timeout waiting for phase ${step.targetPhases.join('/')} (still ${state})`;
+        }
+      }
+      return step.finished === true;
+    }
+
+    function finalizePendingAutoStep() {
+      const step = pendingAutoStep;
+      pendingAutoStep = null;
+      autoWaiting = true;
+      accumulator = 0;
+      if (step.error) step.reject(new Error(step.error));
+      else step.resolve();
+    }
+
+    function observe() {
+      return {
+        phase: state,
+        phase_time: phaseTime,
+        score,
+        claw: {
+          position: { x: hubBody.position.x, y: hubBody.position.y, z: hubBody.position.z },
+          target: { x: targetX, z: targetZ },
+          finger_angle: fingerAngle,
+          held_prize_id: grip ? prizes.indexOf(grip.prize) : null,
+        },
+        prizes: prizes.map((p, id) => ({
+          id,
+          position: { x: p.body.position.x, y: p.body.position.y, z: p.body.position.z },
+          velocity: { x: p.body.velocity.x, y: p.body.velocity.y, z: p.body.velocity.z },
+          shape: p.shape,
+          scored: p.scored,
+        })),
+        bounds: { x: [-4.15, 4.15], z: [-3.15, 3.15] },
+        speeds: { idle: 3.1, carrying: 2.2 },
+        tray: {
+          center: { x: 3.55, z: 2.8 },
+          score_bounds: { x: [2.45, 4.65], z: [1.9, 3.75], y_max: 0.95, speed_max: 1.2 },
+        },
+      };
+    }
+
+    function capture() {
+      renderer.render(scene, camera);
+      const src = renderer.domElement;
+      const scale = Math.min(1, 768 / Math.max(src.width, src.height));
+      const w = Math.max(1, Math.round(src.width * scale));
+      const h = Math.max(1, Math.round(src.height * scale));
+      const out = document.createElement('canvas');
+      out.width = w;
+      out.height = h;
+      out.getContext('2d').drawImage(src, 0, 0, w, h);
+      return out.toDataURL('image/jpeg', 0.8);
+    }
+
+    async function beginAuto() {
+      autoMode = true;
+      keys.clear();
+      if (state === 'idle' || state === 'carrying') {
+        autoWaiting = true;
+        accumulator = 0;
+      } else {
+        await waitForPhase(['idle', 'carrying'], AUTO_MECHANISM_MAX_TICKS);
+      }
+    }
+
+    const AUTO_DIRECTION_KEYS = { left: 'KeyA', right: 'KeyD', forward: 'KeyW', backward: 'KeyS' };
+
+    async function execute(action, step) {
+      if (!autoMode) throw new Error('execute() called outside auto mode');
+
+      if (action === 'grab') {
+        if (state !== 'idle') throw new Error(`cannot grab in phase ${state}`);
+        triggerArm();
+        await waitForPhase(['carrying'], AUTO_MECHANISM_MAX_TICKS);
+        await waitTicks(360);
+        return;
+      }
+      if (action === 'release') {
+        if (state !== 'carrying') throw new Error(`cannot release in phase ${state}`);
+        triggerArm();
+        await waitForPhase(['idle'], AUTO_MECHANISM_MAX_TICKS);
+        await waitTicks(360);
+        return;
+      }
+      if (action === 'wait') {
+        await waitTicks(step.ticks);
+        return;
+      }
+      const code = AUTO_DIRECTION_KEYS[action];
+      if (!code) throw new Error(`unknown action ${action}`);
+      keys.add(code);
+      try {
+        await waitTicks(step.ticks);
+      } finally {
+        keys.delete(code);
+      }
+    }
+
+    function endAuto() {
+      if (pendingAutoStep) {
+        const step = pendingAutoStep;
+        pendingAutoStep = null;
+        step.reject(new Error('auto ended'));
+      }
+      keys.clear();
+      autoMode = false;
+      autoWaiting = false;
+      accumulator = 0;
+    }
+
+    const clock = new THREE.Clock();
+    // 120 Hz control/physics ticks keep the fast moving pads from stepping through
+    // small prizes.  Each tick updates the claw by only a few millimetres.
+    const fixedTimeStep = 1 / 120;
+    let accumulator = 0;
+
+    function physicsTick(dt) {
+      updateSequence(dt);
+      moveHub(dt);
+      animateFingers(dt);
+      applyGripAssist();
+
+      // Exactly one physics integration per control tick.  Kinematic bodies are
+      // restored afterwards because their pose was already advanced explicitly.
+      world.step(dt);
+      restoreKinematicTargets();
+      fingerAngle = getAverageFingerAngle();
+      tryAcquireGrip();
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.05);
+
+      if (autoMode && autoWaiting) {
+        accumulator = 0;
+      } else {
+        accumulator += dt;
+
+        // Bound catch-up work after a suspended/background tab.
+        let steps = 0;
+        while (accumulator >= fixedTimeStep && steps < 8) {
+          physicsTick(fixedTimeStep);
+          accumulator -= fixedTimeStep;
+          steps += 1;
+          if (autoMode && pendingAutoStep) {
+            pendingAutoStep.ticksDone += 1;
+            if (evaluatePendingAutoStep()) break;
+          }
+        }
+        if (steps === 8) accumulator = 0;
+      }
+
+      for (const { body, mesh } of dynamicObjects) {
+        mesh.position.copy(body.position);
+        mesh.quaternion.copy(body.quaternion);
+      }
+
+      // Keep every visible claw part on the exact physics pose.
+      hubMesh.position.copy(hubBody.position);
+      for (const f of fingers) {
+        f.mesh.position.copy(f.body.position);
+        f.mesh.quaternion.copy(f.body.quaternion);
+      }
+
+      const cableLength = Math.max(0.35, 6.74 - hubBody.position.y);
+      cable.scale.y = cableLength;
+      cable.position.set(hubBody.position.x, 6.74 - cableLength / 2, hubBody.position.z);
+      bridge.position.x = hubBody.position.x;
+      carriage.position.set(hubBody.position.x, 6.9, hubBody.position.z);
+
+      updateScore();
+      stateEl.textContent = `${labels[state] ?? state.toUpperCase()}${grip ? ' • HOLD' : ''}`;
+      renderer.render(scene, camera);
+
+      if (autoMode && pendingAutoStep && pendingAutoStep.finished) {
+        finalizePendingAutoStep();
+      }
+    }
+    animate();
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    mountClefDemo({ observe, capture, beginAuto, execute, endAuto });
+  </script>
+</body>
+</html>
