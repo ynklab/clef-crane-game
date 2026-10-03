@@ -6,6 +6,62 @@
 // 状態表示はすべてここに閉じる。
 
 const STEP_TICKS = { fine: 12, medium: 30, coarse: 72 };
+const STEP_CHOICES = Object.keys(STEP_TICKS);
+const ACTION_CHOICES = {
+  idle: ['left', 'right', 'forward', 'backward', 'grab', 'wait'],
+  carrying: ['left', 'right', 'forward', 'backward', 'release', 'wait'],
+};
+
+// 独立重み付きランダム選択。モデルの各選択肢確率を重みとして1件だけ標本化する。
+// 連続したループ内の各ステップは互いに独立で、特定パターン（例: grab を永遠に
+// 避け続ける）が発生しないことを保証しない — それは意図した挙動であり、
+// 上位(top1)確定選択のフォールバックは行わない。
+function sampleChoice(probabilities, allowedChoices) {
+  const allowedSet = new Set(allowedChoices);
+  const keys = Object.keys(probabilities);
+  if (keys.length === 0) {
+    throw new Error('probabilities が空です');
+  }
+  for (const k of keys) {
+    if (!allowedSet.has(k)) {
+      throw new Error(`許可されていない choice 名: ${k}`);
+    }
+  }
+  let sum = 0;
+  for (const k of keys) {
+    const p = probabilities[k];
+    if (typeof p !== 'number' || !Number.isFinite(p) || p < 0 || p > 1) {
+      throw new Error(`不正な確率値: ${k}=${p}`);
+    }
+    sum += p;
+  }
+  if (!Number.isFinite(sum) || sum <= 0) {
+    throw new Error(`確率の合計が不正です: ${sum}`);
+  }
+  // sum で正規化した累積分布から1件を標本化する（モデルの丸め誤差で和が
+  // 厳密に1でなくても比例重みは変わらない）。重み0の選択肢は選ばれない。
+  const r = Math.random() * sum;
+  let cumulative = 0;
+  let lastPositive = null;
+  for (const k of keys) {
+    const p = probabilities[k];
+    if (p <= 0) continue;
+    cumulative += p;
+    lastPositive = k;
+    if (r < cumulative) return k;
+  }
+  // 浮動小数点の丸め上振れで累積和が r を僅かに下回った場合のフォールバック:
+  // 最後に見つかった正の重みの選択肢を採用する（top1 への差し替えではない）。
+  return lastPositive;
+}
+
+// answer.probabilities から1件標本化し、choice と confidence（標本化された
+// 選択肢自身の元確率）だけを差し替えた浅いコピーを返す。probabilities 自体は
+// そのまま保持し、HUD の全選択肢バー表示に使う。
+function sampleAnswer(answer, allowedChoices) {
+  const choice = sampleChoice(answer.probabilities, allowedChoices);
+  return { ...answer, choice, confidence: answer.probabilities[choice] };
+}
 
 export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto }) {
   const style = document.createElement('style');
@@ -215,17 +271,35 @@ export function mountClefDemo({ observe, capture, beginAuto, execute, endAuto })
       }
       if (myGen !== generation) return;
 
-      const actionAns = data?.answers?.action;
-      const stepAns = data?.answers?.step;
-      if (!actionAns || typeof actionAns.choice !== 'string' || !stepAns || typeof stepAns.choice !== 'string') {
-        fail(myGen, '不正な応答形式 (answers.action/step が見つからない)');
+      const rawActionAns = data?.answers?.action;
+      const rawStepAns = data?.answers?.step;
+      if (
+        !rawActionAns || typeof rawActionAns.probabilities !== 'object' || rawActionAns.probabilities === null ||
+        !rawStepAns || typeof rawStepAns.probabilities !== 'object' || rawStepAns.probabilities === null
+      ) {
+        fail(myGen, '不正な応答形式 (answers.action/step の probabilities が見つからない)');
+        return;
+      }
+      const allowedActions = ACTION_CHOICES[before.phase];
+      if (!allowedActions) {
+        fail(myGen, `不正な phase: ${before.phase}`);
+        return;
+      }
+
+      // action と step はそれぞれ独立に、モデルの確率を重みとして標本化する
+      // （top1 確定選択やしきい値による差し替えは行わない）。不正な確率分布
+      // （非有限・負・>1・和が0以下・未許可の選択肢名）は既存のエラー/停止
+      // 経路に流し、フォールバックはしない。
+      let actionAns;
+      let stepAns;
+      try {
+        actionAns = sampleAnswer(rawActionAns, allowedActions);
+        stepAns = sampleAnswer(rawStepAns, STEP_CHOICES);
+      } catch (err) {
+        fail(myGen, `不正な確率分布: ${err.message}`);
         return;
       }
       const ticks = STEP_TICKS[stepAns.choice];
-      if (ticks === undefined) {
-        fail(myGen, `不正な step choice: ${stepAns.choice}`);
-        return;
-      }
 
       decisionCount += 1;
       updateCount();

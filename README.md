@@ -55,6 +55,33 @@ HTTP 422 instead of being silently accepted. This does not guarantee
 grab/release success or scoring — Clef's visual judgment of alignment can be
 wrong, and missed prizes are reported as failures, not hidden.
 
+## Action/step selection is sampled, not top-1
+
+The browser (not the server) turns each `answers.action` / `answers.step`
+probability distribution returned by `/api/decide` into one executed choice.
+For every decision, `action` and `step` are each sampled independently in
+`clef-demo.js` by drawing a single value proportional to that distribution's
+own probabilities (normalized by their sum, so small model rounding error in
+the reported probabilities does not bias the draw) — the model's highest-probability
+option is not automatically picked, and no top-k/temperature/retry logic is
+applied. A choice with probability 0 can never be drawn; floating-point
+round-off at the extreme upper end of the cumulative distribution falls back
+to the last choice with positive probability, not to the top-1 choice. The
+HUD's shown confidence, the chosen bar highlight, the action actually
+executed, and the `history` entries sent back to the model on later requests
+all reflect this sampled choice together with that choice's own original
+probability (not the model's top probability).
+Because each decision is sampled independently, there is no guarantee against
+repeatedly avoiding (or repeatedly picking) a particular option such as
+`grab` or `wait` across a run — that is expected behavior of independent
+weighted random selection, not a bug. A malformed distribution (a
+probability that is negative, greater than 1, non-finite, a choice name
+outside the phase's allowed set, or a distribution whose probabilities sum to
+zero or non-finite) is treated as a decision failure: it goes through the
+same error/stop path as an HTTP or network failure, auto stops, and no
+top-1 fallback choice is substituted.
+
+
 ## If a running tab gets HTTP 422 from `/api/decide`
 
 The server enforces one strict request schema with no compatibility shim for
