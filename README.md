@@ -2,6 +2,9 @@
 
 A browser demo that sends only the phase, held-prize flag, a JPEG screenshot, and recent action history to the pinned Cloudflare Clef model, and applies its discrete action choices to the physics crane game.
 
+<img width="2634" height="1966" alt="image" src="https://github.com/user-attachments/assets/398636e1-4253-40a7-a4b5-04cb6be857e0" />
+
+
 ## Requirements
 
 - Linux on a CUDA-capable NVIDIA GPU with BF16 support and a compatible NVIDIA driver.
