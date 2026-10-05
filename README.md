@@ -27,14 +27,14 @@ cmake --build llama.cpp/build --target llama-server --config Release -j
 
 The Clef server needs both the text+decision-head model and its vision
 multimodal projector (`mmproj`). `llama-server`'s `-hf` flag can download the
-public `abenzerps/Clef-GGUF` repository and automatically download an available
+public `ggml-org/Clef-GGUF` repository and automatically download an available
 mmproj. The model and projector downloads require substantial bandwidth and
 disk space on first use:
 
 ```sh
 cd llama.cpp
 ./build/bin/llama-server \
-    -hf abenzerps/Clef-GGUF:Q4_K_M \
+    -hf ggml-org/Clef-GGUF:Q4_K_M \
     --ubatch-size 2048 \
     --host 127.0.0.1 \
     --port 8080
