@@ -1,5 +1,6 @@
-"""FastAPI server that loads the pinned Cloudflare/clef model and drives the
-crane game in ``index.html`` by answering a joint action/step choice per turn.
+"""FastAPI server that proxies the crane game in ``index.html`` to a
+llama.cpp ``llama-server`` instance serving the Clef decision model,
+answering a joint action/step choice per turn.
 
 Routes: GET /, /index.html, /clef-demo.js, GET /api/health, POST /api/decide.
 """
@@ -11,15 +12,14 @@ import binascii
 import hashlib
 import io
 import logging
-import sys
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal
+from typing import Annotated, Any, Literal
 
-import torch
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -36,6 +36,11 @@ MODEL_REPO = "Cloudflare/clef"
 MODEL_REVISION = "2f3de3dd85f379784083b0814d997ab627200f0c"
 HOST = "0.0.0.0"
 PORT = 8000
+
+UPSTREAM_BASE_URL = os.environ.get("CLEF_UPSTREAM_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+UPSTREAM_HEALTH_URL = f"{UPSTREAM_BASE_URL}/health"
+UPSTREAM_SYSTEMONE_URL = f"{UPSTREAM_BASE_URL}/v1/systemone"
+UPSTREAM_TIMEOUT_SECONDS = float(os.environ.get("CLEF_UPSTREAM_TIMEOUT_SECONDS", "60"))
 
 STATIC_DIR = Path(__file__).resolve().parent
 INDEX_HTML_PATH = STATIC_DIR / "index.html"
@@ -189,7 +194,7 @@ class DecideResponse(BaseModel):
     elapsed_ms: float
 
 
-def _decode_image(data_url: str) -> Image.Image:
+def _decode_image(data_url: str) -> None:
     encoded = data_url[len(IMAGE_DATA_URL_PREFIX) :]
     try:
         raw = base64.b64decode(encoded, validate=True)
@@ -204,58 +209,20 @@ def _decode_image(data_url: str) -> Image.Image:
         raise ValueError(f"image must be JPEG, got {image.format!r}")
     if max(image.size) > MAX_IMAGE_SIDE:
         raise ValueError(f"image long side {max(image.size)} exceeds {MAX_IMAGE_SIDE}")
-    return image.convert("RGB")
+    # The validated original data URL is forwarded to llama-server; no image copy is needed here.
 
 
-@dataclass
-class ModelState:
-    model: Any
-    processor: Any
-    systemone: Callable[..., dict[str, Any]]
-
-
-MODEL_STATE: ModelState | None = None
 INFERENCE_LOCK = threading.Lock()
-
-
-def _load_model() -> ModelState:
-    logger.info("probing CUDA availability")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available; this server requires a CUDA GPU")
-    if not torch.cuda.is_bf16_supported():
-        raise RuntimeError("the GPU does not support bfloat16")
-    probe = torch.ones((8, 8), device="cuda", dtype=torch.bfloat16)
-    probe_result = (probe @ probe)[0, 0].item()
-    if probe_result != 8:
-        raise RuntimeError(f"bf16 matmul probe failed: expected 8, got {probe_result}")
-    logger.info("CUDA bf16 probe passed on %s", torch.cuda.get_device_name(0))
-
-    from huggingface_hub import snapshot_download
-
-    logger.info("downloading %s at revision %s", MODEL_REPO, MODEL_REVISION)
-    model_path = snapshot_download(MODEL_REPO, revision=MODEL_REVISION)
-    if model_path not in sys.path:
-        sys.path.insert(0, model_path)
-    from joint_schema_model import load_release_model, systemone  # type: ignore[import-not-found]
-
-    logger.info("loading Clef model weights from %s", model_path)
-    model, processor = load_release_model(
-        model_path, device="cuda", dtype=torch.bfloat16, attn_implementation="sdpa"
-    )
-    logger.info("Clef model loaded and ready")
-    return ModelState(model=model, processor=processor, systemone=systemone)
+HTTP_CLIENT: httpx.Client | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global MODEL_STATE
-    try:
-        MODEL_STATE = _load_model()
-    except Exception:
-        logger.exception("failed to load the Clef model; server will not start")
-        raise
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.Client(timeout=UPSTREAM_TIMEOUT_SECONDS)
     yield
-    MODEL_STATE = None
+    HTTP_CLIENT.close()
+    HTTP_CLIENT = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -296,25 +263,34 @@ def get_clef_demo_js() -> FileResponse:
 
 @app.get("/api/health")
 def get_health() -> dict[str, Any]:
-    if MODEL_STATE is None:
-        raise HTTPException(status_code=503, detail="model not loaded")
+    if HTTP_CLIENT is None:
+        raise HTTPException(status_code=503, detail="upstream model server is not available")
+    try:
+        response = HTTP_CLIENT.get(UPSTREAM_HEALTH_URL)
+    except httpx.HTTPError as exc:
+        logger.warning("upstream health check failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="upstream model server is not reachable"
+        ) from exc
+    if response.status_code != 200:
+        raise HTTPException(status_code=503, detail="upstream model server is not ready")
     return {
         "ready": True,
         "model": MODEL_REPO,
         "revision": MODEL_REVISION,
-        "device": "cuda",
+        "device": "llama.cpp",
     }
 
 
 @app.post("/api/decide", response_model=DecideResponse)
 def post_decide(request: DecideRequest) -> DecideResponse:
     try:
-        image = _decode_image(request.image)
+        _decode_image(request.image)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if MODEL_STATE is None:
-        raise HTTPException(status_code=503, detail="model not loaded")
+    if HTTP_CLIENT is None:
+        raise HTTPException(status_code=503, detail="upstream model server is not available")
 
     if not INFERENCE_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="an inference is already in progress")
@@ -327,29 +303,51 @@ def post_decide(request: DecideRequest) -> DecideResponse:
             "history": history,
         }
         questions = build_questions(request.phase)
+        payload = {
+            "state": state,
+            "questions": questions,
+            "images": [request.image],
+        }
         started = time.perf_counter()
         try:
-            result = MODEL_STATE.systemone(
-                MODEL_STATE.model,
-                MODEL_STATE.processor,
-                {
-                    "model": "clef",
-                    "state": state,
-                    "images": [image],
-                    "questions": questions,
-                },
-            )
-        except Exception as exc:
-            logger.exception("Clef inference failed")
-            raise HTTPException(status_code=500, detail=f"inference failed: {exc}") from exc
+            response = HTTP_CLIENT.post(UPSTREAM_SYSTEMONE_URL, json=payload)
+        except httpx.HTTPError as exc:
+            logger.exception("upstream Clef request failed")
+            raise HTTPException(
+                status_code=502, detail="upstream model server request failed"
+            ) from exc
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        if response.status_code == 503:
+            raise HTTPException(status_code=503, detail="upstream model server is not ready")
+        if response.status_code != 200:
+            logger.error(
+                "upstream Clef request returned status %s", response.status_code
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"upstream model server returned status {response.status_code}",
+            )
+        try:
+            result = response.json()
+        except ValueError as exc:
+            logger.exception("upstream Clef response was not valid JSON")
+            raise HTTPException(
+                status_code=502, detail="upstream model server returned an invalid response"
+            ) from exc
+        answers = result.get("answers") if isinstance(result, dict) else None
+        if not isinstance(answers, dict):
+            logger.error("upstream Clef response is missing an 'answers' object")
+            raise HTTPException(
+                status_code=502, detail="upstream model server response is missing answers"
+            )
     finally:
         INFERENCE_LOCK.release()
 
     return DecideResponse(
         model=MODEL_REPO,
         revision=MODEL_REVISION,
-        answers=result["answers"],
+        answers=answers,
         elapsed_ms=elapsed_ms,
     )
 

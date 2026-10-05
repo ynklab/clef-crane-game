@@ -1,27 +1,68 @@
 # Clef Crane Game
 
-A browser demo that sends only the phase, held-prize flag, a JPEG screenshot, and recent action history to the pinned Cloudflare Clef model, and applies its discrete action choices to the physics crane game.
+A browser demo that sends only the phase, held-prize flag, a JPEG screenshot, and recent action history to the pinned Clef decision model, and applies its discrete action choices to the physics crane game.
 
 <img width="2634" height="1966" alt="image" src="https://github.com/user-attachments/assets/398636e1-4253-40a7-a4b5-04cb6be857e0" />
 
 
 ## Requirements
 
-- Linux on a CUDA-capable NVIDIA GPU with BF16 support and a compatible NVIDIA driver.
 - Python 3.12 and `uv`.
-- Internet access to download the pinned model (about 55 GB) and the browser's Three.js / cannon-es modules from esm.sh.
+- Git, a C/C++ toolchain, and `cmake` to build `llama.cpp`.
+- A running `llama-server` (built from [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp)) serving the Clef GGUF model and its multimodal projector on its `/v1/systemone` endpoint. The backend (`main.py`) is a thin FastAPI proxy — it does not load any model itself, it forwards requests to `llama-server` over HTTP.
+- Internet access for the browser's Three.js / cannon-es modules from esm.sh, and for `llama-server` to download the Clef GGUF model/mmproj from Hugging Face on first run.
 - Chromium or Firefox with WebGL enabled.
 
-The configured PyTorch wheels target CUDA 13.0 on Linux. There is no CPU or hosted-model fallback.
+There is no in-process PyTorch/Transformers model loading anymore, and no CUDA requirement for this repo itself (GPU/CPU requirements now belong to however `llama-server` is built and run).
 
-## Run
+## 1. Build and run `llama-server` with the Clef model
+
+Clone and build `llama.cpp` anywhere on your machine:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp
+cmake -S llama.cpp -B llama.cpp/build
+cmake --build llama.cpp/build --target llama-server --config Release -j
+```
+
+The Clef server needs both the text+decision-head model and its vision
+multimodal projector (`mmproj`). `llama-server`'s `-hf` flag can download the
+public `abenzerps/Clef-GGUF` repository and automatically download an available
+mmproj. The model and projector downloads require substantial bandwidth and
+disk space on first use:
+
+```sh
+cd llama.cpp
+./build/bin/llama-server \
+    -hf abenzerps/Clef-GGUF:Q4_K_M \
+    --ubatch-size 2048 \
+    --host 127.0.0.1 \
+    --port 8080
+```
+
+`--ubatch-size 2048` is required — a smoke test at the default 512 failed on
+the image prompt, while 2048 worked. Clef is a decision model: the server
+exposes `/v1/systemone` and `/health`, not text generation. Wait for its
+ready log line, then confirm with:
+
+```sh
+curl http://127.0.0.1:8080/health
+```
+
+## 2. Run the Clef Crane Game backend/frontend
+
+In a separate terminal, from this repository's directory:
 
 ```sh
 uv sync --python 3.12
 uv run --no-sync python main.py
 ```
 
-Wait for the startup log `Clef model loaded and ready`, then open <http://127.0.0.1:8000/>. Startup probes CUDA/BF16 and loads `Cloudflare/clef` at revision `2f3de3dd85f379784083b0814d997ab627200f0c` into the standard Hugging Face cache. The browser enables automatic operation only after `/api/health` confirms that model is ready. Manual WASD/arrow and Space controls remain available while auto is stopped.
+By default `main.py` proxies to `http://127.0.0.1:8080`. To point at a
+different host or port, set `CLEF_UPSTREAM_BASE_URL` (e.g.
+`CLEF_UPSTREAM_BASE_URL=http://127.0.0.1:9000 uv run --no-sync python main.py`).
+
+Open <http://127.0.0.1:8000/>. The browser enables automatic operation only after `/api/health` confirms the upstream `llama-server` is ready (polling its `/health` endpoint). Manual WASD/arrow and Space controls remain available while auto is stopped.
 The service binds to `0.0.0.0:8000` (accessible on the host's network interfaces). Stop it with Ctrl-C. No API key is required.
 
 The human player's view remains the existing oblique 3D camera, with no compass or directional-arrow overlay (removed as ineffective); manual WASD/arrow and Space controls still map to world axes W = -Z, A = -X, S = +Z, D = +X, the player just has to learn that mapping rather than read it off an on-screen arrow.
@@ -33,7 +74,9 @@ idle/carrying phase, a strict boolean for whether the claw is holding a prize,
 a screenshot, and up to 5 recent `{action, step}` entries (oldest first). No
 coordinates, prize lists, velocities, scores, or numeric navigation offsets are
 sent to the model or included in its prompt; Clef must judge claw/prize/tray
-alignment purely from the screenshot.
+alignment purely from the screenshot. The backend forwards this as `llama-server`'s
+`/v1/systemone` `state`/`questions` request shape, with the screenshot passed
+through unmodified as `images: [image]`.
 
 The screenshot sent to the model is captured from a dedicated straight-down
 top-down camera, not the oblique camera the human player sees. An oblique
@@ -153,4 +196,4 @@ real upward-facing contact between the blade and the prize is detected every
 frame, and the flag clears on loss of support or release. Scoring remains
 based on the real tray position and settling speed. Different shapes, sizes
 and mechanisms can miss or drop a prize; pickup is not guaranteed.
-
+</content>
